@@ -1,5 +1,40 @@
 # -*- mode: julia; -*-
 Base.__precompile__(true)
+"""
+The WAV package is a pure Julia library for reading and writing the
+[WAV audio file format](https://en.wikipedia.org/wiki/WAV).
+
+It provides [`wavread`](@ref), [`wavwrite`](@ref) and
+[`wavappend`](@ref) functions to read, write, and append to WAV files.
+The function [`wavplay`](@ref) provides simple audio playback.
+
+These functions behave similar to the former MATLAB functions of the
+same name.
+
+This module also provides `wavread` and `wavwrite` as `load` and
+`save` methods for `format"WAV"` to the `FileIO` package.
+
+To read and write `CUE` and `INFO` chunks, there are experimental
+functions [`wav_cue_read`](@ref), [`wav_cue_write`](@ref),
+[`wav_info_read`](@ref), [`wav_info_write`](@ref).
+
+# Example
+```julia
+using WAV
+fs = 8e3
+t = 0.0:1/fs:prevfloat(1.0)
+f = 1e3
+y = sin.(2pi * f * t) * 0.1
+wavwrite(y, "example.wav", Fs=fs)
+
+y, fs = wavread("example.wav")
+y = sin.(2pi * 2f * t) * 0.1
+wavappend(y, "example.wav")
+
+y, fs = wavread("example.wav")
+wavplay(y, fs)
+```
+"""
 module WAV
 export wavread, wavwrite, wavappend, wavplay
 export WAVChunk, WAVMarker, wav_cue_read, wav_cue_write, wav_info_write, wav_info_read
@@ -10,32 +45,8 @@ import Libdl
 using FileIO
 using Logging
 
-function __init__()
-    module_dir = dirname(@__FILE__)
-    try 
-        # check we haven't already imported this package into the namespace
-        # this will throw an error otherwise
-        WAV
-    catch e
-        if isa(e, UndefVarError) && e.var == :WAV
-            if Libdl.find_library(["libpulse-simple", "libpulse-simple.so.0"]) != ""
-                include(joinpath(module_dir, "wavplay-pulse.jl"))
-            elseif Libdl.find_library(["AudioToolbox"],
-                                      ["/System/Library/Frameworks/AudioToolbox.framework/Versions/A"]) != ""
-                include(joinpath(module_dir, "wavplay-audioqueue.jl"))
-            else
-                wavplay(data, fs) = @warn "wavplay is not currently implemented on $(Sys.KERNEL)"
-            end
-        else
-            throw(e)
-        end
-    end
-    nothing
-end
-
 include("AudioDisplay.jl")
 include("WAVChunk.jl")
-wavplay(fname) = wavplay(wavread(fname)[1:2]...)
 
 # The WAV specification states that numbers are written to disk in little endian form.
 write_le(stream::IO, value) = write(stream, htol(value))
@@ -105,12 +116,66 @@ const KSDATAFORMAT_SUBTYPE_ALAW = [
 0x80, 0x00,
 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71
                                    ]
+
+"""
+    getformat(chunks::Vector{WAVChunk})::WAVFormat
+
+Takes the vector of `WAVChunk` elements returned in the `opt` result
+of function `wavread` and extracts format information, returned as an
+instance of type `WAVFormat`.
+
+The `WAVFormat` type is defined as:
+
+```julia
+struct WAVFormat
+    compression_code::UInt16
+    nchannels::UInt16
+    sample_rate::UInt32
+    bytes_per_second::UInt32 # average bytes per second
+    block_align::UInt16
+    nbits::UInt16
+    ext::WAVFormatExtension
+end
+```
+
+The `ext` field of type `WAVFormatExtension` is defined as:
+
+```julia
+struct WAVFormatExtension
+    nbits::UInt16 # overrides nbits in WAVFormat type
+    channel_mask::UInt32
+    sub_format::Array{UInt8, 1} # 16 byte GUID
+    WAVFormatExtension() = new(0, 0, Array(UInt8, 0))
+    WAVFormatExtension(nb, cm, sb) = new(nb, cm, sb)
+end
+```
+
+You can use the `isformat` function to test how the samples are
+encoded, without worrying about the `WAVFormatExtension` type.
+Extended WAV files were added to deal with some ambiguity in the
+original specification.
+"""
 function getformat(chunks::Vector{WAVChunk})::WAVFormat
     data = chunks[findfirst(c -> c.id == Symbol("fmt "), chunks)].data
     buf = IOBuffer(data[5:end])
     return read_format(buf, convert(UInt32, length(data[5:end])))
 end
 
+"""
+    isformat(fmt::WAVFormat, code)
+
+The `isformat` function takes the `WAVFormat` object returned by
+`WAV.getformat` and `code` can be one of the following constants:
+
+* `WAVE_FORMAT_PCM`
+* `WAVE_FORMAT_IEEE_FLOAT`
+* `WAVE_FORMAT_ALAW`
+* `WAVE_FORMAT_MULAW`
+* `WAVE_FORMAT_EXTENSIBLE`
+
+The function returns `true` when the samples are encoded in the
+specified `code`.
+"""
 function isformat(fmt::WAVFormat, code)
     if code != WAVE_FORMAT_EXTENSIBLE && isextensible(fmt)
         subtype = UInt8[]
@@ -248,7 +313,7 @@ end
 
 ieee_float_container_type(nbits) = (nbits == 32 ? Float32 : (nbits == 64 ? Float64 : error("$nbits bits is not supported for WAVE_FORMAT_IEEE_FLOAT.")))
 
-function read_pcm_samples(io::IO, fmt::WAVFormat, subrange)
+function read_pcm_samples(io::IO, chunk_size, fmt::WAVFormat, subrange)
     nbits = bits_per_sample(fmt)
     if isempty(subrange)
         return Array{pcm_container_type(nbits), 2}(undef, 0, fmt.nchannels)
@@ -264,6 +329,7 @@ function read_pcm_samples(io::IO, fmt::WAVFormat, subrange)
     skip(io, convert(UInt, (first(subrange) - 1) * nbytes * fmt.nchannels))
     raw_sample = Vector{UInt8}(undef, nbytes*length(samples))
     read!(io, raw_sample)
+    skip(io, chunk_size - convert(UInt, last(subrange) * nbytes * fmt.nchannels))
     raw_sample = reshape(raw_sample, nbytes, size(samples, 2), size(samples, 1))
     for i = 1:size(samples, 1)
         for j = 1:size(samples, 2)
@@ -279,7 +345,7 @@ function read_pcm_samples(io::IO, fmt::WAVFormat, subrange)
     convert.(sample_type, signed.(samples))
 end
 
-function read_ieee_float_samples(io::IO, fmt::WAVFormat, subrange, ::Type{floatType}) where {floatType}
+function read_ieee_float_samples(io::IO, chunk_size, fmt::WAVFormat, subrange, ::Type{floatType}) where {floatType}
     if isempty(subrange)
         return Array{floatType, 2}(undef, 0, fmt.nchannels)
     end
@@ -289,16 +355,17 @@ function read_ieee_float_samples(io::IO, fmt::WAVFormat, subrange, ::Type{floatT
     skip(io, convert(UInt, (first(subrange) - 1) * (nbits / 8) * fmt.nchannels))
     samples = Vector{floatType}(undef, fmt.nchannels*nblocks)
     read!(io, samples) # read_le(stream::IO, x::Type{T}) where {T} = ltoh(fastread(stream, T))
+    skip(io, chunk_size - convert(UInt, last(subrange) * (nbits / 8) * fmt.nchannels))
     copy(reshape(samples, Int(fmt.nchannels), Int(nblocks))')
 end
 
 # take the loop variable type out of the loop
-function read_ieee_float_samples(io::IO, fmt::WAVFormat, subrange)
+function read_ieee_float_samples(io::IO, chunk_size, fmt::WAVFormat, subrange)
     floatType = ieee_float_container_type(bits_per_sample(fmt))
-    read_ieee_float_samples(io, fmt, subrange, floatType)
+    read_ieee_float_samples(io, chunk_size, fmt, subrange, floatType)
 end
 
-function read_companded_samples(io::IO, fmt::WAVFormat, subrange, table)
+function read_companded_samples(io::IO, chunk_size, fmt::WAVFormat, subrange, table)
     if isempty(subrange)
         return Array{eltype(table), 2}(undef, 0, fmt.nchannels)
     end
@@ -313,10 +380,11 @@ function read_companded_samples(io::IO, fmt::WAVFormat, subrange, table)
             samples[i, j] = table[compressedByte + 1]
         end
     end
+    skip(io, convert(UInt, chunk_size - last(subrange) * fmt.nchannels))
     return samples
 end
 
-function read_mulaw_samples(io::IO, fmt::WAVFormat, subrange)
+function read_mulaw_samples(io::IO, chunk_size, fmt::WAVFormat, subrange)
     # Quantized μ-law algorithm -- Use a look up table to convert
     # From Wikipedia, ITU-T Recommendation G.711 and G.191 specify the following intervals:
     #
@@ -378,10 +446,10 @@ function read_mulaw_samples(io::IO, fmt::WAVFormat, subrange)
     56,    48,    40,    32,    24,    16,     8,     0
      ]
     @assert length(MuLawDecompressTable) == 256
-    return read_companded_samples(io, fmt, subrange, MuLawDecompressTable)
+    return read_companded_samples(io, chunk_size, fmt, subrange, MuLawDecompressTable)
 end
 
-function read_alaw_samples(io::IO, fmt::WAVFormat, subrange)
+function read_alaw_samples(io::IO, chunk_size, fmt::WAVFormat, subrange)
     # Quantized A-law algorithm -- Use a look up table to convert
     ALawDecompressTable =
     [
@@ -419,7 +487,7 @@ function read_alaw_samples(io::IO, fmt::WAVFormat, subrange)
     944,   912,  1008,   976,   816,   784,   880,   848
      ]
     @assert length(ALawDecompressTable) == 256
-    return read_companded_samples(io, fmt, subrange, ALawDecompressTable)
+    return read_companded_samples(io, chunk_size, fmt, subrange, ALawDecompressTable)
 end
 
 function compress_sample_mulaw(sample)
@@ -536,15 +604,15 @@ function read_data(io::IO, chunk_size, fmt::WAVFormat, format, subrange)
         subrange = 1:convert(UInt, chunk_size / fmt.block_align)
     end
     if isformat(fmt, WAVE_FORMAT_PCM)
-        samples = read_pcm_samples(io, fmt, subrange)
+        samples = read_pcm_samples(io, chunk_size, fmt, subrange)
         convert_to_double = x -> convert_pcm_to_double(x, bits_per_sample(fmt))
     elseif isformat(fmt, WAVE_FORMAT_IEEE_FLOAT)
-        samples = read_ieee_float_samples(io, fmt, subrange)
+        samples = read_ieee_float_samples(io, chunk_size, fmt, subrange)
     elseif isformat(fmt, WAVE_FORMAT_MULAW)
-        samples = read_mulaw_samples(io, fmt, subrange)
+        samples = read_mulaw_samples(io, chunk_size, fmt, subrange)
         convert_to_double = x -> convert_pcm_to_double(x, 16)
     elseif isformat(fmt, WAVE_FORMAT_ALAW)
-        samples = read_alaw_samples(io, fmt, subrange)
+        samples = read_alaw_samples(io, chunk_size, fmt, subrange)
         convert_to_double = x -> convert_pcm_to_double(x, 16)
     else
         error("$(fmt.compression_code) is an unsupported compression code!")
@@ -617,6 +685,71 @@ end
 make_range(subrange) = subrange
 make_range(subrange::Number) = 1:convert(Int, subrange)
 
+"""
+    wavread(io::IO; subrange=:, format="double")
+    wavread(filename::AbstractString; subrange=:, format="double")
+
+Reads the samples from a WAV file. The samples are converted to
+floating point values in the range −1.0 to 1.0 by default.
+
+The available options, and the default values, are:
+
+* `format` selects the form of data returned:
+  * `format="double"` (default) returns double-precision floating point
+    (`Float64`) values in the range −1.0 to 1.0.
+  * `format="native"` returns the values as encoded in the file.
+  * `format="size"` returns a 2-tuple (`n`, `m`) containing the number of
+    samples 'n' and the number of channels 'm' in the file (like `size(y)`),
+    rather than the regular 4-tuple `(y, Fs, nbits, opt)` with the
+    actual samples in `y`.
+
+* `subrange` controls which samples are returned.
+  The default (`:`) returns all samples in the file.
+  Passing an integer `N` (or equivalently the range `1:N`) returns
+  the first `N` samples of each channel.
+  Passing a unitrange `I:J` returns `length(I:J)` consecutive
+  samples from each channel, starting with the `I`-th sample.
+
+The function returns a 4-tuple with elements
+
+* `y`: A 2-dimensional array containing the waveform samples,
+  where the row index represents the time axis
+  and the colum index the channel number
+* `Fs`: The sampling frequency in hertz
+* `nbits`: the number of bits used to encode each sample
+* `opt`: A vector of [`WAVChunk`](@ref) elements representing
+  optional chunksfound in the WAV file.
+
+The elements in the `opt` vector depend on the contents
+of the WAV file. A `WAVChunk` is defined as
+
+```julia
+struct WAVChunk
+    id::Symbol
+    data::Vector{UInt8}
+end
+```
+
+where `id` is the four-character chunk ID. All valid WAV files will
+contain a `fmt` chunk, with `id==Symbol("fmt ")` (note the trailing
+space).
+
+In order to obtain the contents of the format chunk, call
+`WAV.getformat(opt)`.
+
+The following methods are also defined to make this function
+compatible with MATLAB’s former `wavread` function:
+
+    wavread(filename::AbstractString, fmt::AbstractString) = wavread(filename, format=fmt)
+    wavread(filename::AbstractString, n) = wavread(filename, subrange=n)
+    wavread(filename::AbstractString, n, fmt) = wavread(filename, subrange=n, format=fmt)
+
+# Example
+
+    y, fs, nbits, opt = wavread("example.wav")
+
+See also: [`wavwrite`](@ref)
+"""
 function wavread(io::IO; subrange=(:), format="double")
     chunk_size = read_header(io)
     samples = Array{Float64, 1}()
@@ -624,20 +757,20 @@ function wavread(io::IO; subrange=(:), format="double")
     sample_rate = Float32(0.0)
     opt = WAVChunk[]
 
-    # Note: This assumes that the format chunk is written in the file before the data chunk. The
-    # specification does not require this assumption, but most real files are written that way.
-
     # Subtract the size of the format field from chunk_size; now it holds the size
     # of all the sub-chunks
     chunk_size -= 4
     # GitHub Issue #18: Check if there is enough data to read another chunk
     subchunk_header_size = 4 + sizeof(UInt32)
     fmt = WAVFormat()
+    data_position = 0
+    data_size = 0
     while chunk_size >= subchunk_header_size
         # Read subchunk ID and size
         subchunk_id = Vector{UInt8}(undef, 4)
         read!(io, subchunk_id)
         subchunk_size = read_le(io, UInt32)
+        nextchunk_start = position(io) + subchunk_size
         if subchunk_size > chunk_size
             chunk_size = 0
             break
@@ -650,15 +783,21 @@ function wavread(io::IO; subrange=(:), format="double")
             nbits = bits_per_sample(fmt)
             push!(opt, WAVChunk(fmt))
         elseif subchunk_id == b"data"
-            if format == "size"
-                return convert(Int, subchunk_size / fmt.block_align), convert(Int, fmt.nchannels)
-            end
-            samples = read_data(io, subchunk_size, fmt, format, make_range(subrange))
+            data_position = position(io)
+            data_size = subchunk_size
         else
             subchunk_data = Vector{UInt8}(undef, subchunk_size)
             read!(io, subchunk_data)
             push!(opt, WAVChunk(Symbol(subchunk_id), subchunk_data))
         end
+        seek(io, nextchunk_start)
+    end
+    if data_position != 0
+        seek(io, data_position)
+        if format == "size"
+            return convert(Int, data_size / fmt.block_align), convert(Int, fmt.nchannels)
+        end
+        samples = read_data(io, data_size, fmt, format, make_range(subrange))
     end
     return samples, sample_rate, nbits, opt
 end
@@ -689,6 +828,96 @@ function get_default_precision(samples, compression)
     get_default_pcm_precision(samples)
 end
 
+"""
+    wavwrite(y::AbstractArray, io::IO;
+             Fs=8000, nbits=0, compression=0, chunks::Vector{WAVChunk}=WAVChunk[])
+    wavwrite(y::AbstractArray, filename::String;
+             Fs=8000, nbits=0, compression=0, chunks::Vector{WAVChunk}=WAVChunk[])
+
+Writes sample matrix `y` in RIFF/WAVE format to a file. Each column of
+the data represents a different channel. Stereo files contain two
+columns (left and right).
+
+The second argument accepts either an `IO` object or a filename
+(`String`).
+
+The function choses by default a sample rate of 8 kHz and an output
+data type and bits-per-sample number based on `eltype(y)`. These
+defaults can be changed using optional keyword arguments:
+
+   * `Fs`: sampling frequency in hertz
+   * `nbits`: specify the number of bits to be used to encode each
+     sample; the default (0) is an automatic choice based on
+     the values of `compression` and `eltype(samples)`
+   * `compression` controls the type of encoding used in the file,
+     and can be one of
+     * `WAVE_FORMAT_PCM`: `UInt8`, `Int16`, etc. integer encoding
+     * `WAVE_FORMAT_IEEE_FLOAT`: `Float32` or `Float64` encoding
+     * `WAVE_FORMAT_ALAW`: ITU-T G.711 A-law encoding (8-bit log-scale,
+       used in European telephone networks)
+     * `WAVE_FORMAT_MULAW`: ITU-T G.711 µ-law encoding (8-bit log-scale,
+       used in American telephone networks)
+     The default (`0`) is to pick an encoding automatically based on
+     `typeof(samples)` (see below).
+   * `chunks` (default = `WAVChunk[]`): a vector of `WAVChunk` objects to be written to the file (in addition to the format chunk). See below for some utilities for creating `CUE` and `INFO` chunks.
+
+Unless otherwise specified via `nbits` and `compression`, the type of
+the input array `y` determines the data format used in the generated
+file. The function attempts to picks among the encodings commonly
+supported by other WAV-reading audio software the one that best
+preserves the provided input type.
+
+For `Integer` input arrays, and `compression=WAVE_FORMAT_PCM` or
+`compression=0`, the permitted sample-value ranges are:
+
+|`nbits`| `eltype(y)` | supported range     | output type |
+|-------|-------------|---------------------|-------------|
+| 0     | UInt8,Int16 |    full range       | UInt8,Int16 |
+| 0     | Int32       |  –2^23 ≤ y < 2^23   | Int32       |
+| 8     | <: Integer  |      0 ≤ y ≤ 255    | UInt8       |
+| 16    | <: Integer  | –32768 ≤ y ≤ +32767 | Int16       |
+| 24    | <: Integer  |  –2^23 ≤ y < 2^23   | Int32       |
+| 32    | <: Integer  |  –2^31 ≤ y < 2^31   | Int32       |
+
+If `y` is a floating-point array, and
+`compression=WAVE_FORMAT_IEEE_FLOAT` or `compression=0`, the full
+range of Float32 values are supported:
+
+|`nbits`| `eltype(y)`     | supported range     | output type |
+|-------|-----------------|---------------------|-------------|
+| 0     | Float32,Float64 | –Inf32 ≤ y ≤ +Inf32 | Float32     |
+| 32    | Float32,Float64 | –Inf32 ≤ y ≤ +Inf32 | Float32     |
+| 64    | Float32,Float64 | –Inf64 ≤ y ≤ +Inf64 | Float64     |
+
+If `y` is a floating-point array, and `compression=WAVE_FORMAT_PCM`,
+the input data ranges are:
+
+|`nbits`| `eltype(y)`      | supported range | output type |
+|-------|------------------|-----------------|-------------|
+| 8     | Float32, Float64 | –1.0 ≤ y ≤ +1.0 | UInt8       |
+| 16    | Float32, Float64 | –1.0 ≤ y ≤ +1.0 | Int16       |
+| 24    | Float32, Float64 | –1.0 ≤ y ≤ +1.0 | Int32       |
+| 32    | Float32, Float64 | –1.0 ≤ y ≤ +1.0 | Int32       |
+
+The output format column shows the element type returned by
+`wavread(..., format=-"native")`.
+
+The following methods are also defined to make this function
+compatible with MATLAB’s former `wavwrite` function:
+
+```julia
+wavwrite(y::Array, f::Real, filename::String) = wavwrite(y, filename, Fs=f)
+wavwrite(y::Array, f::Real, N::Real, filename::String) = wavwrite(y, filename, Fs=f, nbits=N)
+wavwrite(y::Array{T}, io::IO) where {T<:Integer} = wavwrite(y, io, nbits=sizeof(T)*8)
+wavwrite(y::Array{T}, filename::String) where {T<:Integer} = wavwrite(y, filename, nbits=sizeof(T)*8)
+wavwrite(y::Array{Int32}, io::IO) = wavwrite(y, io, nbits=24)
+wavwrite(y::Array{Int32}, filename::String) = wavwrite(y, filename, nbits=24)
+wavwrite(y::Array{T}, io::IO) where {T<:FloatingPoint} = wavwrite(y, io, nbits=sizeof(T)*8, compression=WAVE_FORMAT_IEEE_FLOAT)
+wavwrite(y::Array{T}, filename::String) where {T<:FloatingPoint} = wavwrite(y, filename, nbits=sizeof(T)*8, compression=WAVE_FORMAT_IEEE_FLOAT)
+```
+
+See also: [`wavread`](@ref), [`wavappend`](@ref)
+"""
 function wavwrite(samples::AbstractArray, io::IO; Fs=8000, nbits=0, compression=0,
                   chunks::Vector{WAVChunk}=WAVChunk[])
     if compression == 0
@@ -760,6 +989,14 @@ function wavwrite(samples::AbstractArray, filename::AbstractString; Fs=8000, nbi
     end
 end
 
+"""
+    wavappend(samples::AbstractArray, io::IO)
+    wavappend(samples::AbstractArray, filename::AbstractString)
+
+Append samples to an existing WAV file. All parameters (data type and
+range, output format, number of bits, number of channels, etc.) are
+assumed to match.
+"""
 function wavappend(samples::AbstractArray, io::IO)
     seekstart(io)
     chunk_size = read_header(io)
@@ -814,5 +1051,35 @@ save(s::Stream{format"WAV"}, data; kwargs...) = wavwrite(data, s.io; kwargs...)
 
 load(f::File{format"WAV"}; kwargs...) = wavread(f.filename; kwargs...)
 save(f::File{format"WAV"}, data; kwargs...) = wavwrite(data, f.filename; kwargs...)
+
+"""
+    wavplay(data, fs)
+    wavplay(filename::AbstractString)
+
+Plays the audio waveform `data` at sampling frequency `fs` (in hertz).
+To play a stereo signal, provide two columns in array `data` (left and
+right channel), as in [`wavwrite`](@ref).
+
+The `filename` form reads both waveform data and sampling frequency
+from the named WAV file to play it.
+
+The supported backends are:
+* AudioQueue (macOS)
+* PulseAudio (Linux, libpulse-simple)
+* PlaySound  (Windows)
+
+See also: [`wavwrite`](@ref)
+"""
+function wavplay end
+wavplay(fname::AbstractString) = wavplay(wavread(fname)[1:2]...)
+@static if Sys.islinux()
+    include("wavplay-pulse.jl")
+elseif Sys.isapple()
+    include("wavplay-audioqueue.jl")
+elseif Sys.iswindows()
+    include("wavplay-win32.jl")
+else
+    wavplay(data, fs) = @warn "wavplay is not currently implemented on $(Sys.KERNEL)"
+end
 
 end # module
